@@ -1,7 +1,7 @@
-# MagicWand - select text anywhere in Windows, click the wand, get Google's answer in a popup.
+# MagicWand - select text anywhere in Windows, click the orb, get Google's answer in a card under the cursor.
 # Windows PowerShell 5.1, needs -STA. No admin, no account, no API key.
-#   Left-click the wand  : Google search (AI Overview) in a small popup next to the cursor
-#   Right-click the wand : Google AI Mode
+#   Left-click the orb   : Google (AI Overview, compact phone layout) in a card under the cursor
+#   Right-click the orb  : Google AI Mode
 #   Tray icon click      : look up what is on the clipboard (fallback for apps where no wand shows)
 # Script must stay pure ASCII.
 
@@ -25,8 +25,6 @@ function Write-Log([string]$msg) {
 }
 
 # ---- 2. settings --------------------------------------------------------------
-$script:PopupW      = 540     # popup size in DIPs
-$script:PopupH      = 720
 $script:WandTimeout = 4.0     # seconds the wand stays visible
 $script:DoubleCopy  = $false   # Ctrl+C twice = look up the clipboard (off: DeepL uses the same gesture)
 # Apps whose text cursor is not the system I-beam: any drag / double-click shows the wand.
@@ -54,6 +52,13 @@ public static class MWNative {
     [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int i);
     [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr h, int i, int v);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int val, int size);
+    public static void StyleWindow(IntPtr h, bool dark) {   // Windows 11 rounded corners + dark frame
+        int round = 2; DwmSetWindowAttribute(h, 33, ref round, 4);
+        int d = dark ? 1 : 0; DwmSetWindowAttribute(h, 20, ref d, 4);
+    }
     static readonly IntPtr IBeam = LoadCursor(IntPtr.Zero, new IntPtr(32513));
 
     public static bool IsDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
@@ -76,34 +81,98 @@ public static class MWNative {
 }
 '@
 
-# ---- 4. the wand window --------------------------------------------------------
-[xml]$xaml = @'
+# ---- 4. the wand: a little glowing orb that pops up next to the selection -------
+$script:Dark = $false
+try { $script:Dark = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize').AppsUseLightTheme -eq 0 } catch {}
+$script:Theme = if ($script:Dark) {
+    @{ BG = '#202124'; FG = '#E8EAED'; FG2 = '#9AA0A6'; LINE = '#3C4043'; SEGBG = '#2D2E31'; SEG = '#45474B'; HOVER = '#33FFFFFF'; SKEL = '#3C4043' }
+} else {
+    @{ BG = '#FFFFFF'; FG = '#1F1F1F'; FG2 = '#5F6368'; LINE = '#DADCE0'; SEGBG = '#F1F3F4'; SEG = '#FFFFFF'; HOVER = '#14000000'; SKEL = '#E8EAED' }
+}
+function Expand-Theme([string]$xamlText) {
+    foreach ($k in $script:Theme.Keys) { $xamlText = $xamlText.Replace("{$k}", $script:Theme[$k]) }
+    $xamlText
+}
+
+# The orb is shared by the wand and the popup header (same gradient + sparkle).
+$script:OrbXaml = @'
+<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <Ellipse>
+    <Ellipse.Fill>
+      <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+        <GradientStop Color="#4285F4" Offset="0"/>
+        <GradientStop Color="#9B72CB" Offset="0.55"/>
+        <GradientStop Color="#D96570" Offset="1"/>
+      </LinearGradientBrush>
+    </Ellipse.Fill>
+  </Ellipse>
+  <Ellipse Margin="2" Opacity="0.35">
+    <Ellipse.Fill>
+      <RadialGradientBrush GradientOrigin="0.3,0.25" Center="0.3,0.25" RadiusX="0.7" RadiusY="0.7">
+        <GradientStop Color="#FFFFFFFF" Offset="0"/>
+        <GradientStop Color="#00FFFFFF" Offset="1"/>
+      </RadialGradientBrush>
+    </Ellipse.Fill>
+  </Ellipse>
+  <Viewbox Margin="7">
+    <Canvas Width="24" Height="24" RenderTransformOrigin="0.5,0.5">
+      <Canvas.RenderTransform><RotateTransform x:Name="Spin"/></Canvas.RenderTransform>
+      <Path Fill="White" Data="M12,0 C12.9,6.6 17.4,11.1 24,12 C17.4,12.9 12.9,17.4 12,24 C11.1,17.4 6.6,12.9 0,12 C6.6,11.1 11.1,6.6 12,0 Z"/>
+      <Path Fill="White" Opacity="0.85" Data="M20,0 C20.3,2.2 21.8,3.7 24,4 C21.8,4.3 20.3,5.8 20,8 C19.7,5.8 18.2,4.3 16,4 C18.2,3.7 19.7,2.2 20,0 Z"/>
+    </Canvas>
+  </Viewbox>
+</Grid>
+'@
+function New-Orb {
+    $o = [Windows.Markup.XamlReader]::Parse($script:OrbXaml)
+    @{ Root = $o; Spin = $o.FindName('Spin') }
+}
+function Start-Spin($orb) {
+    $a = New-Object System.Windows.Media.Animation.DoubleAnimation(0, 360, [TimeSpan]::FromSeconds(1.6))
+    $a.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+    $orb.Spin.BeginAnimation([System.Windows.Media.RotateTransform]::AngleProperty, $a)
+}
+function Stop-Spin($orb) {
+    $a = New-Object System.Windows.Media.Animation.DoubleAnimation(0, [TimeSpan]::FromMilliseconds(300))
+    $orb.Spin.BeginAnimation([System.Windows.Media.RotateTransform]::AngleProperty, $a)
+}
+
+[xml]$wandXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         WindowStyle="None" AllowsTransparency="True" Background="Transparent" Topmost="True"
-        ShowInTaskbar="False" ShowActivated="False" ResizeMode="NoResize" Width="40" Height="40">
-  <Border x:Name="Btn" Margin="4" CornerRadius="16" Background="#FFFFFF" BorderBrush="#DADCE0" BorderThickness="1"
-          Cursor="Hand" ToolTip="Look it up on Google  (right-click: AI Mode)">
-    <Border.Effect><DropShadowEffect BlurRadius="8" ShadowDepth="1" Opacity="0.3"/></Border.Effect>
-    <Viewbox Width="20" Height="20">
-      <Canvas Width="20" Height="20">
-        <Line X1="3" Y1="17" X2="12" Y2="8" Stroke="#5F6368" StrokeThickness="2.4" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
-        <Path Fill="#1A73E8" Data="M15,1 L16.2,3.8 L19,5 L16.2,6.2 L15,9 L13.8,6.2 L11,5 L13.8,3.8 Z"/>
-        <Path Fill="#FBBC04" Data="M6,2 L6.6,3.4 L8,4 L6.6,4.6 L6,6 L5.4,4.6 L4,4 L5.4,3.4 Z"/>
-        <Path Fill="#EA4335" Data="M18,12 L18.5,13.5 L20,14 L18.5,14.5 L18,16 L17.5,14.5 L16,14 L17.5,13.5 Z"/>
-      </Canvas>
-    </Viewbox>
-  </Border>
+        ShowInTaskbar="False" ShowActivated="False" ResizeMode="NoResize" Width="52" Height="52">
+  <Grid x:Name="Btn" Width="30" Height="30" Cursor="Hand" Background="Transparent" RenderTransformOrigin="0.5,0.5"
+        ToolTip="Ask about this  (right-click: AI Mode)">
+    <Grid.RenderTransform><ScaleTransform x:Name="Pop" ScaleX="1" ScaleY="1"/></Grid.RenderTransform>
+    <Grid.Effect><DropShadowEffect x:Name="Glow" Color="#8E6CEF" BlurRadius="14" ShadowDepth="0" Opacity="0.75"/></Grid.Effect>
+    <ContentControl x:Name="OrbHost"/>
+  </Grid>
 </Window>
 '@
-$wand = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
+$wand = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $wandXaml))
 $btn  = $wand.FindName('Btn')
+$script:WandPop  = $wand.FindName('Pop')
+$script:WandGlow = $wand.FindName('Glow')
+$script:WandOrb  = New-Orb
+$wand.FindName('OrbHost').Content = $script:WandOrb.Root
+$btn.Add_MouseEnter({
+    $a = New-Object System.Windows.Media.Animation.DoubleAnimation(1.15, [TimeSpan]::FromMilliseconds(140))
+    $script:WandPop.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleXProperty, $a)
+    $script:WandPop.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleYProperty, $a)
+    $script:WandAt = [datetime]::Now
+})
+$btn.Add_MouseLeave({
+    $a = New-Object System.Windows.Media.Animation.DoubleAnimation(1.0, [TimeSpan]::FromMilliseconds(140))
+    $script:WandPop.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleXProperty, $a)
+    $script:WandPop.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleYProperty, $a)
+})
 $wand.Left = -10000; $wand.Top = -10000
 $wand.Show()
 $script:WandHwnd = (New-Object System.Windows.Interop.WindowInteropHelper $wand).Handle
 [MWNative]::MakeNoActivate($script:WandHwnd)
 $script:Scale = [System.Windows.PresentationSource]::FromVisual($wand).CompositionTarget.TransformToDevice.M11
-$script:WandPx = [int](40 * $script:Scale)
+$script:WandPx = [int](52 * $script:Scale)
 
 $script:WandShown = $false
 $script:WandAt = [datetime]::MinValue
@@ -112,12 +181,20 @@ $script:SourceHwnd = [IntPtr]::Zero
 
 function Show-Wand([int]$x, [int]$y) {
     $wa = [System.Windows.Forms.Screen]::FromPoint((New-Object System.Drawing.Point $x, $y)).WorkingArea
-    $wx = [Math]::Min([Math]::Max($x + 8, $wa.Left), $wa.Right - $script:WandPx)
-    $wy = $y - $script:WandPx - 6
-    if ($wy -lt $wa.Top) { $wy = $y + 16 }
+    $wx = [Math]::Min([Math]::Max($x + 2, $wa.Left), $wa.Right - $script:WandPx)
+    $wy = $y - $script:WandPx + [int](8 * $script:Scale)
+    if ($wy -lt $wa.Top) { $wy = $y + 12 }
     $script:WandX = $wx; $script:WandY = $wy
     # HWND_TOPMOST, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
     [void][MWNative]::SetWindowPos($script:WandHwnd, [IntPtr](-1), $wx, $wy, 0, 0, 0x0051)
+    # pop in with a little overshoot
+    $a = New-Object System.Windows.Media.Animation.DoubleAnimation(0.3, 1.0, [TimeSpan]::FromMilliseconds(260))
+    $a.EasingFunction = New-Object System.Windows.Media.Animation.BackEase -Property @{ Amplitude = 0.5; EasingMode = 'EaseOut' }
+    $script:WandPop.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleXProperty, $a)
+    $script:WandPop.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleYProperty, $a)
+    $g = New-Object System.Windows.Media.Animation.DoubleAnimation(0.45, 0.9, [TimeSpan]::FromMilliseconds(900))
+    $g.AutoReverse = $true; $g.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+    $script:WandGlow.BeginAnimation([System.Windows.Media.Effects.DropShadowEffect]::OpacityProperty, $g)
     $script:WandShown = $true
     $script:WandAt = [datetime]::Now
     $script:SourceHwnd = [MWNative]::GetForegroundWindow()
@@ -125,6 +202,7 @@ function Show-Wand([int]$x, [int]$y) {
 function Hide-Wand {
     if (-not $script:WandShown) { return }
     [void][MWNative]::SetWindowPos($script:WandHwnd, [IntPtr]::Zero, 0, 0, 0, 0, 0x0093)   # HIDE|NOSIZE|NOMOVE|NOACTIVATE
+    $script:WandGlow.BeginAnimation([System.Windows.Media.Effects.DropShadowEffect]::OpacityProperty, $null)
     $script:WandShown = $false
 }
 function Test-OverWand($p) {
@@ -169,53 +247,269 @@ function Get-SelectedText {
     $text
 }
 
-# ---- 6. open Google in a small app window next to the cursor ---------------------
-function Get-BrowserPath {
-    foreach ($exe in 'msedge.exe', 'chrome.exe') {
-        foreach ($root in 'HKCU:', 'HKLM:') {
-            try {
-                $p = (Get-ItemProperty "$root\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\$exe" -ErrorAction Stop).'(default)'
-                if ($p -and (Test-Path $p)) { return $p }
-            } catch {}
-        }
-    }
-    $null
-}
-$script:Browser = Get-BrowserPath
-$script:PendingMove = $null
+# ---- 6. the answer card: Google, compact, inside a modern popup under the cursor ---
+$script:Lib = Join-Path $PSScriptRoot 'lib'
+Add-Type -Path (Join-Path $script:Lib 'Microsoft.Web.WebView2.Core.dll')
+Add-Type -Path (Join-Path $script:Lib 'Microsoft.Web.WebView2.Wpf.dll')
+[Microsoft.Web.WebView2.Core.CoreWebView2Environment]::SetLoaderDllFolderPath($script:Lib)
+# Google's phone layout is the compact one: AI Overview first, no side panels.
+$script:MobileUA = 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36'
 
-function ConvertTo-Query([string]$text) {
+$popXaml = Expand-Theme @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="MagicWand" WindowStyle="None" ResizeMode="CanResize" ShowInTaskbar="False" Topmost="True"
+        Width="400" Height="560" MinWidth="320" MinHeight="320" Background="{BG}" BorderBrush="{LINE}" BorderThickness="1"
+        FontFamily="Segoe UI Variable Text, Segoe UI">
+  <WindowChrome.WindowChrome>
+    <WindowChrome CaptionHeight="0" ResizeBorderThickness="6" GlassFrameThickness="0" CornerRadius="0" UseAeroCaptionButtons="False"/>
+  </WindowChrome.WindowChrome>
+  <Window.Resources>
+    <Style x:Key="Icon" TargetType="Button">
+      <Setter Property="Width" Value="30"/>
+      <Setter Property="Height" Value="30"/>
+      <Setter Property="Foreground" Value="{FG2}"/>
+      <Setter Property="FontFamily" Value="Segoe Fluent Icons, Segoe MDL2 Assets"/>
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Focusable" Value="False"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="b" CornerRadius="8" Background="Transparent">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="b" Property="Background" Value="{HOVER}"/>
+                <Setter Property="Foreground" Value="{FG}"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="Seg" TargetType="RadioButton">
+      <Setter Property="Foreground" Value="{FG2}"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Focusable" Value="False"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="RadioButton">
+            <Border x:Name="b" CornerRadius="11" Padding="12,4" Background="Transparent">
+              <ContentPresenter/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="b" Property="Background" Value="{SEG}"/>
+                <Setter Property="Foreground" Value="{FG}"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+  <Grid>
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+    <Grid x:Name="Header" Background="Transparent" Margin="12,10,8,8">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="Auto"/>
+        <ColumnDefinition Width="*"/>
+        <ColumnDefinition Width="Auto"/>
+      </Grid.ColumnDefinitions>
+      <ContentControl x:Name="OrbHost" Width="30" Height="30" VerticalAlignment="Top" Margin="0,2,0,0"/>
+      <StackPanel Grid.Column="1" Margin="10,0,6,0" VerticalAlignment="Center">
+        <TextBlock x:Name="QueryText" FontSize="14" FontWeight="SemiBold" Foreground="{FG}" TextWrapping="Wrap"
+                   TextTrimming="CharacterEllipsis" MaxHeight="40"/>
+        <TextBlock x:Name="Status" FontSize="11.5" Foreground="{FG2}" Margin="0,1,0,0"/>
+      </StackPanel>
+      <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Top">
+        <Button x:Name="BtnPin" Style="{StaticResource Icon}" Content="&#xE718;" ToolTip="Keep open"/>
+        <Button x:Name="BtnOpen" Style="{StaticResource Icon}" Content="&#xE8A7;" ToolTip="Open in browser"/>
+        <Button x:Name="BtnClose" Style="{StaticResource Icon}" Content="&#xE711;" ToolTip="Close (Esc)"/>
+      </StackPanel>
+    </Grid>
+    <Grid Grid.Row="1" x:Name="Body">
+      <StackPanel x:Name="Skeleton" Margin="18,8,18,0">
+        <StackPanel.Triggers>
+          <EventTrigger RoutedEvent="Loaded">
+            <BeginStoryboard>
+              <Storyboard>
+                <DoubleAnimation Storyboard.TargetProperty="Opacity" From="1" To="0.35" Duration="0:0:0.8"
+                                 AutoReverse="True" RepeatBehavior="Forever"/>
+              </Storyboard>
+            </BeginStoryboard>
+          </EventTrigger>
+        </StackPanel.Triggers>
+        <Border Height="12" CornerRadius="6" Background="{SKEL}" Margin="0,6" Width="140" HorizontalAlignment="Left"/>
+        <Border Height="12" CornerRadius="6" Background="{SKEL}" Margin="0,6"/>
+        <Border Height="12" CornerRadius="6" Background="{SKEL}" Margin="0,6,40,6"/>
+        <Border Height="12" CornerRadius="6" Background="{SKEL}" Margin="0,6,90,6"/>
+        <Border Height="12" CornerRadius="6" Background="{SKEL}" Margin="0,22,0,6"/>
+        <Border Height="12" CornerRadius="6" Background="{SKEL}" Margin="0,6,60,6"/>
+        <Border Height="12" CornerRadius="6" Background="{SKEL}" Margin="0,6,130,6"/>
+      </StackPanel>
+    </Grid>
+    <Grid Grid.Row="2" Margin="10,6,10,10">
+      <Border CornerRadius="13" Background="{SEGBG}" Padding="2" HorizontalAlignment="Left">
+        <StackPanel Orientation="Horizontal">
+          <RadioButton x:Name="ModeSearch" Style="{StaticResource Seg}" Content="AI Overview" GroupName="mode" IsChecked="True"/>
+          <RadioButton x:Name="ModeAi" Style="{StaticResource Seg}" Content="AI Mode" GroupName="mode"/>
+        </StackPanel>
+      </Border>
+      <TextBlock HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="11" Foreground="{FG2}" Text="Esc to close"/>
+    </Grid>
+  </Grid>
+</Window>
+'@
+$pop = [Windows.Markup.XamlReader]::Parse($popXaml)
+$P = @{}
+foreach ($n in 'Header', 'OrbHost', 'QueryText', 'Status', 'BtnPin', 'BtnOpen', 'BtnClose', 'Body', 'Skeleton', 'ModeSearch', 'ModeAi') {
+    $P[$n] = $pop.FindName($n)
+}
+$script:PopOrb = New-Orb
+$P.OrbHost.Content = $script:PopOrb.Root
+
+$web = New-Object Microsoft.Web.WebView2.Wpf.WebView2
+$web.Visibility = 'Hidden'
+$web.DefaultBackgroundColor = [System.Drawing.ColorTranslator]::FromHtml($script:Theme.BG)
+$cp = New-Object Microsoft.Web.WebView2.Wpf.CoreWebView2CreationProperties
+$cp.UserDataFolder = Join-Path $env:LOCALAPPDATA 'MagicWand\WebView2'
+$web.CreationProperties = $cp
+[void]$P.Body.Children.Add($web)
+
+$script:WebReady   = $false
+$script:PendingUrl = $null
+$script:PopupShown = $false
+$script:Pinned     = $false
+$script:Populating = $false
+$script:Query      = ''
+$script:PopHwnd    = [IntPtr]::Zero
+
+# Skip Google's own logo + search box (our header already shows the query).
+$script:TidyJs = '(function(){var f=document.querySelector("form[action=' + "'/search'" + ']");if(f){var b=f.getBoundingClientRect().bottom+window.scrollY;if(b>0&&b<400)window.scrollTo(0,b);}})();'
+function Show-WebContent {
+    [void]$web.CoreWebView2.ExecuteScriptAsync($script:TidyJs)
+    $web.Visibility = 'Visible'
+    $P.Skeleton.Visibility = 'Collapsed'
+    Stop-Spin $script:PopOrb
+    $P.Status.Text = if ($P.ModeAi.IsChecked) { 'Google AI Mode' } else { 'Google ' + $script:Dot + ' AI Overview' }
+}
+$script:Dot = [char]0x00B7
+
+$web.Add_CoreWebView2InitializationCompleted({
+    param($s, $e)
+    if (-not $e.IsSuccess) { Write-Log "webview2: $($e.InitializationException.Message)"; return }
+    $c = $web.CoreWebView2
+    $c.Settings.UserAgent = $script:MobileUA
+    $c.Settings.IsStatusBarEnabled = $false
+    $c.Settings.AreDevToolsEnabled = $false
+    $web.ZoomFactor = 0.9
+    $c.Profile.PreferredColorScheme = if ($script:Dark) { 'Dark' } else { 'Light' }
+    $c.Add_NewWindowRequested({
+        param($s2, $e2)
+        $e2.Handled = $true
+        if ($e2.Uri -match '^https?://') { Start-Process $e2.Uri }
+    })
+    $c.Add_DOMContentLoaded({ Show-WebContent })
+    $script:WebReady = $true
+    if ($script:PendingUrl) { $u = $script:PendingUrl; $script:PendingUrl = $null; $c.Navigate($u) }
+    if (-not $script:PopupShown) { $pop.Hide() }   # warm-up done
+    if ($env:MAGICWAND_DEMO) { try { Open-Lookup $env:MAGICWAND_DEMO $false } catch { Write-Log "demo: $($_.Exception.Message) @ $($_.InvocationInfo.ScriptLineNumber)" } }   # for screenshots/tests
+})
+
+$pop.Add_SourceInitialized({
+    $script:PopHwnd = (New-Object System.Windows.Interop.WindowInteropHelper $pop).Handle
+    [MWNative]::StyleWindow($script:PopHwnd, $script:Dark)
+})
+
+function Get-CleanText([string]$text) {
     $t = $text -replace '(\w)-\s*\r?\n\s*(\w)', '$1$2'      # PDF hyphenation
-    $t = ($t -replace '\s+', ' ').Trim().Trim('.', ',', ';', ':', '"', "'", '(', ')', '[', ']')
-    if (-not $t) { return '' }
-    $words = $t.Split(' ')
-    if ($words.Count -le 6) { return "what is $t" }
+    ($t -replace '\s+', ' ').Trim().Trim('.', ',', ';', ':', '"', "'", '(', ')', '[', ']')
+}
+function ConvertTo-Query([string]$clean) {
+    $words = $clean.Split(' ')
+    if ($words.Count -le 6) { return "what is $clean" }
     'explain: ' + (($words | Select-Object -First 30) -join ' ')
+}
+function Get-SearchUrl {
+    $url = 'https://www.google.com/search?q=' + [uri]::EscapeDataString($script:Query)
+    $url += '&hl=' + [Globalization.CultureInfo]::CurrentUICulture.TwoLetterISOLanguageName   # Google guesses from location otherwise
+    if ($P.ModeAi.IsChecked) { $url += '&udm=50' }
+    $url
+}
+
+function Start-Search {
+    $url = Get-SearchUrl
+    $web.Visibility = 'Hidden'
+    $P.Skeleton.Visibility = 'Visible'
+    Start-Spin $script:PopOrb
+    $P.Status.Text = 'Thinking...'
+    if ($script:WebReady) { $web.CoreWebView2.Navigate($url) } else { $script:PendingUrl = $url }
+}
+
+function Set-PopupPosition {
+    $p = New-Object MWNative+POINT
+    [void][MWNative]::GetCursorPos([ref]$p)
+    $s = $script:Scale
+    $wa = [System.Windows.Forms.Screen]::FromPoint((New-Object System.Drawing.Point $p.X, $p.Y)).WorkingArea
+    $w = [Math]::Min([int]($pop.Width * $s), $wa.Width - 16)
+    $h = [Math]::Min([int]($pop.Height * $s), $wa.Height - 16)
+    $x = [Math]::Min([Math]::Max($p.X - [int](36 * $s), $wa.Left + 8), $wa.Right - $w - 8)
+    $y = $p.Y + [int](24 * $s)                                  # just under the cursor
+    if ($y + $h -gt $wa.Bottom - 8) { $y = [Math]::Max($wa.Top + 8, $p.Y - [int](24 * $s) - $h) }
+    $pop.Width = $w / $s; $pop.Height = $h / $s
+    $pop.Left = $x / $s; $pop.Top = $y / $s
 }
 
 function Open-Lookup([string]$text, [bool]$aiMode) {
-    $q = ConvertTo-Query $text
-    if (-not $q) { return }
-    $url = 'https://www.google.com/search?q=' + [uri]::EscapeDataString($q)
-    if ($aiMode) { $url += '&udm=50' }
-
-    $p = New-Object MWNative+POINT
-    [void][MWNative]::GetCursorPos([ref]$p)
-    $wa = [System.Windows.Forms.Screen]::FromPoint((New-Object System.Drawing.Point $p.X, $p.Y)).WorkingArea
-    $w = [Math]::Min([int]($script:PopupW * $script:Scale), $wa.Width)
-    $h = [Math]::Min([int]($script:PopupH * $script:Scale), $wa.Height)
-    $x = if ($p.X + 24 + $w -le $wa.Right) { $p.X + 24 } else { [Math]::Max($wa.Left, $p.X - 24 - $w) }
-    $y = [Math]::Min([Math]::Max($wa.Top, $p.Y - [int]($h / 3)), $wa.Bottom - $h)
-
-    if (-not $script:Browser) { Start-Process $url; return }
-    $bargs = @("--app=`"$url`"", "--window-size=$($script:PopupW),$($script:PopupH)",
-              "--window-position=$([int]($x / $script:Scale)),$([int]($y / $script:Scale))")
-    # Edge may hand the URL to an already running process, which ignores the size switches:
-    # move the new window ourselves once it comes to the front.
-    $script:PendingMove = @{ Before = [MWNative]::GetForegroundWindow(); X = $x; Y = $y; W = $w; H = $h
-                             Deadline = [datetime]::Now.AddSeconds(5) }
-    Start-Process -FilePath $script:Browser -ArgumentList $bargs
+    $clean = Get-CleanText $text
+    if (-not $clean) { return }
+    $script:Query = ConvertTo-Query $clean
+    $P.QueryText.Text = if ($clean.Length -gt 140) { $clean.Substring(0, 140) + '...' } else { $clean }
+    $script:Populating = $true
+    if ($aiMode) { $P.ModeAi.IsChecked = $true } else { $P.ModeSearch.IsChecked = $true }
+    $script:Populating = $false
+    if (-not $script:PopupShown) { Set-PopupPosition }
+    Start-Search
+    $pop.ShowActivated = $true
+    $pop.Show()
+    [void]$pop.Activate()
+    $script:PopupShown = $true
 }
+
+function Hide-Popup {
+    if (-not $script:PopupShown) { return }
+    $pop.Hide()
+    $script:PopupShown = $false
+}
+
+function Test-InPopup($p) {
+    $r = New-Object MWNative+RECT
+    if (-not [MWNative]::GetWindowRect($script:PopHwnd, [ref]$r)) { return $false }
+    $p.X -ge $r.Left -and $p.X -lt $r.Right -and $p.Y -ge $r.Top -and $p.Y -lt $r.Bottom
+}
+
+$P.BtnClose.Add_Click({ Hide-Popup })
+$P.BtnOpen.Add_Click({
+    $u = if ($web.Source -and $web.Source.AbsoluteUri -match '^https?://') { $web.Source.AbsoluteUri } else { Get-SearchUrl }
+    Start-Process $u
+    if (-not $script:Pinned) { Hide-Popup }
+})
+$P.BtnPin.Add_Click({
+    $script:Pinned = -not $script:Pinned
+    $P.BtnPin.Content = if ($script:Pinned) { [string][char]0xE840 } else { [string][char]0xE718 }
+    $P.BtnPin.ToolTip = if ($script:Pinned) { 'Pinned: stays open' } else { 'Keep open' }
+})
+$P.ModeSearch.Add_Checked({ if (-not $script:Populating -and $script:Query) { Start-Search } })
+$P.ModeAi.Add_Checked({ if (-not $script:Populating -and $script:Query) { Start-Search } })
+$P.Header.Add_MouseLeftButtonDown({ try { $pop.DragMove() } catch {} })
 
 function Invoke-Lookup([bool]$aiMode) {
     Hide-Wand
@@ -225,6 +519,14 @@ function Invoke-Lookup([bool]$aiMode) {
 
 $btn.Add_MouseLeftButtonUp({ try { Invoke-Lookup $false } catch { Write-Log "lookup: $($_.Exception.Message)" } })
 $btn.Add_MouseRightButtonUp({ try { Invoke-Lookup $true } catch { Write-Log "lookup: $($_.Exception.Message)" } })
+
+# Warm up WebView2 off-screen so the first lookup is instant.
+$pop.ShowActivated = $false
+$pop.Left = -20000; $pop.Top = -20000
+$pop.Show()
+[void]$pop.Dispatcher.BeginInvoke([Action]{   # needs the event loop running
+    try { [void]$web.EnsureCoreWebView2Async($null) } catch { Write-Log "webview2: $($_.Exception.Message)" }
+}, [System.Windows.Threading.DispatcherPriority]::Background)
 
 # ---- 7. watch the mouse: drag or double-click over text shows the wand -----------
 $script:Paused   = $false
@@ -249,15 +551,6 @@ function Invoke-Tick {
     [void][MWNative]::GetCursorPos([ref]$p)
     $down = [MWNative]::IsDown(0x01)
 
-    if ($script:PendingMove) {
-        $m = $script:PendingMove
-        $fg = [MWNative]::GetForegroundWindow()
-        if ($fg -ne $m.Before -and $fg -ne [IntPtr]::Zero -and (Get-ProcName $fg) -match '^(msedge|chrome)$') {
-            [void][MWNative]::SetWindowPos($fg, [IntPtr]::Zero, $m.X, $m.Y, $m.W, $m.H, 0x0004)   # NOZORDER
-            $script:PendingMove = $null
-        } elseif ([datetime]::Now -gt $m.Deadline) { $script:PendingMove = $null }
-    }
-
     # Ctrl+C twice (within 600 ms): look up what the user just copied
     $cDown = [MWNative]::IsDown(0x11) -and [MWNative]::IsDown(0x43)
     if ($script:DoubleCopy -and $cDown -and -not $script:CopyHeld -and -not $script:Paused) {
@@ -281,7 +574,10 @@ function Invoke-Tick {
             }
         }
     }
+    if ($script:PopupShown -and [MWNative]::IsDown(0x1B) -and [MWNative]::GetForegroundWindow() -eq $script:PopHwnd) { Hide-Popup }
+
     if ($down -and -not $script:WasDown) {                       # press
+        if ($script:PopupShown -and -not $script:Pinned -and -not (Test-InPopup $p)) { Hide-Popup }
         if (-not (Test-OverWand $p)) {
             Hide-Wand
             $script:DownPt = $p
@@ -361,5 +657,5 @@ $tray.Visible = $true
 
 $script:WandShown = $true; Hide-Wand   # start hidden
 $timer.Start()
-Write-Log "started (browser: $script:Browser, scale: $script:Scale)"
+Write-Log "started (scale: $script:Scale, dark: $script:Dark)"
 [System.Windows.Threading.Dispatcher]::Run()

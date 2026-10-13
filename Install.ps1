@@ -18,6 +18,7 @@ if ($Uninstall) {
 
 [void](New-Item -ItemType Directory -Force $dest)
 Copy-Item (Join-Path $PSScriptRoot 'MagicWand.ps1') $dest -Force
+Copy-Item (Join-Path $PSScriptRoot 'lib') $dest -Recurse -Force
 $script = Join-Path $dest 'MagicWand.ps1'
 $shell = New-Object -ComObject WScript.Shell
 foreach ($l in $links) {
