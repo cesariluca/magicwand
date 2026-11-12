@@ -4,12 +4,17 @@
 #   Right-click the orb  : Google AI Mode
 #   Tray icon click      : look up what is on the clipboard (fallback for apps where no wand shows)
 # Script must stay pure ASCII.
+param(
+    [string]$Demo    # open a card for this text at startup (screenshots, tests)
+)
 
 $ErrorActionPreference = 'Stop'
 
 # ---- 1. single instance / STA -------------------------------------------------
 if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
-    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', "`"$PSCommandPath`"")
+    $relaunch = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', "`"$PSCommandPath`"")
+    if ($Demo) { $relaunch += @('-Demo', "`"$Demo`"") }
+    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList $relaunch
     exit
 }
 $script:Mutex = New-Object Threading.Mutex($false, 'Local\MagicWand.SingleInstance')
@@ -417,11 +422,22 @@ $web.Add_CoreWebView2InitializationCompleted({
         $e2.Handled = $true
         if ($e2.Uri -match '^https?://') { Start-Process $e2.Uri }
     })
+    # The card only shows Google: other sites (result links, redirects) go to the default browser,
+    # other schemes (file:, ms-settings:, custom protocols) are blocked.
+    $c.Add_NavigationStarting({
+        param($s2, $e2)
+        $uri = $null
+        if (-not [uri]::TryCreate($e2.Uri, 'Absolute', [ref]$uri)) { $e2.Cancel = $true; return }
+        if ($uri.Scheme -eq 'about') { return }
+        if ($uri.Scheme -eq 'https' -and $uri.Host -match '(^|\.)google\.[a-z]{2,3}(\.[a-z]{2})?$') { return }
+        $e2.Cancel = $true
+        if ($uri.Scheme -match '^https?$') { Start-Process $uri.AbsoluteUri }
+    })
     $c.Add_DOMContentLoaded({ Show-WebContent })
     $script:WebReady = $true
     if ($script:PendingUrl) { $u = $script:PendingUrl; $script:PendingUrl = $null; $c.Navigate($u) }
     if (-not $script:PopupShown) { $pop.Hide() }   # warm-up done
-    if ($env:MAGICWAND_DEMO) { try { Open-Lookup $env:MAGICWAND_DEMO $false } catch { Write-Log "demo: $($_.Exception.Message) @ $($_.InvocationInfo.ScriptLineNumber)" } }   # for screenshots/tests
+    if ($Demo) { Open-Lookup $Demo $false }       # -Demo "text": open a card at startup (screenshots, tests)
 })
 
 $pop.Add_SourceInitialized({
